@@ -2,7 +2,7 @@
 """ReconMaster 全流程集成测试 — URL收集 → 去重FUZZ注入 → ffuf爆破 → JS下载+trufflehog分析
 
 用法:
-    python test_url_pipeline.py visitcloud.com
+    python tests/test_full_pipeline.py visitcloud.com
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconmaster import SubdomainManager
 from reconmaster.core.url_collector import URLCollector

@@ -2,7 +2,7 @@
 """快速 JS 密钥扫描 — 只下载主页 + JS 文件 → trufflehog，跳过全流程
 
 用法:
-    python fast_scan_js.py tw_targets_v2.txt
+    python tools/fast_scan_js.py targets.txt
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconmaster.config.settings import HTTP_PROXY
 from reconmaster.core.js_analyzer import JSAnalyzer

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import aiohttp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from reconmaster.config.settings import HTTP_PROXY, JS_ANALYSIS_TIMEOUT, TOOL_PATHS
 
 logger = logging.getLogger("ultra_fast")

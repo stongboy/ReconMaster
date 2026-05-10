@@ -2,7 +2,7 @@
 """ReconMaster 集成测试 — 端到端子域名收集+验活流程。
 
 用法:
-    python test_demo.py example.com
+    python tests/test_phase1_subdomain.py example.com
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 # 将项目根加入 sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconmaster import SubdomainManager
 
