@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+.playwright-mcp/
+
+# Results (generated)
+results/
+oneforall/results/
+
+# Large binaries (>100MB — GitHub limit)
+tools/trufflehog.exe
+
+# Database
+*.db
+
+# Temp files
+*.tmp
+tmp_*/
+
+# Archive files (keep extracted binaries only)
+*.zip
+*.tar.gz
+*.7z
