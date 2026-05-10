@@ -1,115 +1,149 @@
 # ReconMaster
 
-自动化安全侦察框架 — 子域名收集 → URL 采集 → FUZZ 爆破 → JS 密钥分析。
+Automated security reconnaissance framework — subdomain discovery → URL collection → web fuzzing → credential leak detection.
 
-## 功能模块
-
-| 阶段 | 模块 | 工具 | 说明 |
-|---|---|---|---|
-| 1 | 子域名收集 | subfinder, OneForAll, FOFA API | 被动 + 主动收集，dnsx 验活 |
-| 2 | URL 收集 | gau, katana | 历史 URL + 主动爬取，支持代理 |
-| 3 | URL 处理 | URLProcessor | 去重、静态分离、FUZZ 注入 |
-| 4 | FUZZ 爆破 | ffuf | 自动校准 (-ac)，并发调度 |
-| 5 | JS 分析 | trufflehog | JS 下载 → 密钥检测 → Verified 分级 |
-
-## 环境要求
-
-- Python 3.10+
-- 外部工具需放置在 `tools/` 目录
-
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 安装 Python 依赖
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. 下载外部工具到 tools/ 目录
-# subfinder:   https://github.com/projectdiscovery/subfinder/releases
-# dnsx:        https://github.com/projectdiscovery/dnsx/releases
-# gau:         https://github.com/lc/gau/releases
-# katana:      https://github.com/projectdiscovery/katana/releases
-# ffuf:        https://github.com/ffuf/ffuf/releases
-# trufflehog:  https://github.com/trufflesecurity/trufflehog/releases
+# 2. Download external tools into tools/ (see Tool Dependencies below)
 
-# 3. 配置代理 (如在国内)
-# 编辑 reconmaster/config/settings.py
-# HTTP_PROXY = "http://127.0.0.1:7890"
+# 3. Configure proxy if needed
+#    Edit reconmaster/config/settings.py → HTTP_PROXY
 
-# 4. 运行测试
-python tests/test_full_pipeline.py visitcloud.com
+# 4. Run
+python run.py example.com
+python run.py example.com --deep     # comprehensive JS analysis (slower)
 ```
 
-## 外部工具清单
+## Pipeline
 
-以下工具需手动下载放入 `tools/` 目录：
+Run `python run.py <target>` to execute all five phases:
 
-| 工具 | 用途 | 下载地址 |
+### Phase 1 — Subdomain Enumeration
+
+Discovers subdomains via passive and active methods, then verifies DNS resolution.
+
+| Source | Method |
+|---|---|
+| subfinder | Passive: certificate transparency, search engines, etc. |
+| FOFA API | Passive: network space search engine |
+| OneForAll | Passive: 30+ data sources aggregated |
+| dnsx (brute-force) | Active: dictionary-based subdomain guess + DNS resolve |
+
+Output: list of verified, resolvable subdomains.
+
+### Phase 2 — URL Collection
+
+Collects endpoint URLs for each verified subdomain.
+
+| Tool | Method | Requires proxy in China? |
 |---|---|---|
-| subfinder.exe | 被动子域名收集 | [releases](https://github.com/projectdiscovery/subfinder/releases) |
-| dnsx.exe | DNS 解析/验活 | [releases](https://github.com/projectdiscovery/dnsx/releases) |
-| gau.exe | 历史 URL 收集 (Wayback Machine) | [releases](https://github.com/lc/gau/releases) |
-| katana.exe | 主动 URL 爬取 | [releases](https://github.com/projectdiscovery/katana/releases) |
-| ffuf.exe | Web Fuzzer | [releases](https://github.com/ffuf/ffuf/releases) |
-| **trufflehog.exe** | **JS 密钥检测** | **[releases](https://github.com/trufflesecurity/trufflehog/releases)** |
+| gau | Wayback Machine historical URLs | Yes |
+| katana | Active crawl (depth 2) | Yes |
 
-> **注意**: trufflehog.exe 约 162MB，未包含在仓库中（超过 GitHub 100MB 限制）。
-> 下载后解压将 `trufflehog.exe` 放入 `tools/` 目录即可使用 Phase 5 JS 分析功能。
-> 如不需要 JS 密钥分析，可以不下载。
+Output: deduplicated URL list across all subdomains.
 
-## 项目结构
+### Phase 3 — URL Processing
+
+Intelligently deduplicates URLs and generates fuzzing targets.
+
+- **Static separation**: `.css`, `.png`, `.jpg`, etc. are discarded; `.js` files go to the JS pool.
+- **Parameter dedup**: URLs sharing the same `(path, parameter_keys)` fingerprint are collapsed — only 2 samples kept per group.
+- **FUZZ injection**: Parameter values are replaced with `FUZZ`; path-only URLs get `/FUZZ` appended.
+
+Output: fuzz task queue + JS URL pool.
+
+### Phase 4 — Web Fuzzing
+
+Runs ffuf against each FUZZ-injected URL with auto-calibration (`-ac`) to filter false positives.
+
+### Phase 5 — Secret Detection
+
+Scans JavaScript files for leaked credentials (API keys, tokens, passwords) using trufflehog.
+
+**Default: Fast mode** (~3–8s per target)
+- Fetches the homepage HTML
+- Extracts `<script src>` URLs
+- Downloads and scans referenced JS + homepage
+- Does NOT require prior URL collection
+
+**Deep mode** (`--deep` flag)
+- Downloads ALL JS files collected in Phase 2–3
+- More comprehensive but slower
+
+All findings are graded by trufflehog's `Verified` field:
+- `Verified=true` → **CRITICAL** (confirmed credential leak, prioritize)
+- `Verified=false` → **INFO** (potential finding, archived for review)
+
+## Tool Dependencies
+
+Download each tool and place in the `tools/` directory:
+
+| Tool | v | Size | Download |
+|---|---|---|---|
+| subfinder | 2.x | ~32MB | [Releases](https://github.com/projectdiscovery/subfinder/releases) |
+| dnsx | 1.x | ~32MB | [Releases](https://github.com/projectdiscovery/dnsx/releases) |
+| gau | 2.x | ~8MB | [Releases](https://github.com/lc/gau/releases) |
+| katana | 1.x | ~45MB | [Releases](https://github.com/projectdiscovery/katana/releases) |
+| ffuf | 2.x | ~8MB | [Releases](https://github.com/ffuf/ffuf/releases) |
+| trufflehog | 3.x | ~162MB | [Releases](https://github.com/trufflesecurity/trufflehog/releases) |
+
+> **trufflehog.exe** is 162MB (exceeds GitHub's 100MB limit) — not included in this repo.
+> Download it separately if you need Phase 5 secret detection. Without it, phases 1–4 still work.
+
+## Configuration
+
+Edit `reconmaster/config/settings.py`:
+
+```python
+# Proxy — required for gau/katana if accessing from China
+HTTP_PROXY  = "http://127.0.0.1:7890"
+
+# FOFA API key
+FOFA_KEY = "your-key-here"
+
+# JS analysis mode
+JS_ANALYSIS_MODE = "fast"   # "fast" (default) or "deep"
+
+# Timeouts and concurrency (tune for your environment)
+TIMEOUT_KATANA  = 2 * 60   # katana crawl timeout per subdomain
+KATANA_DEPTH    = 2        # crawl depth (1=shallow, 3=deep)
+FUZZ_TIMEOUT    = 15.0     # single ffuf request timeout
+FUZZ_CONCURRENCY = 20      # concurrent ffuf threads
+```
+
+## Output Structure
+
+Results are saved to `results/<target>_<timestamp>/`:
+
+```
+results/example.com_20260510_143000/
+├── summary.json          # Pipeline summary
+├── phase2_urls.json      # Collected URLs (gau + katana)
+├── phase3_processed.json # Processed URLs + fuzz tasks
+├── phase4_fuzz.json      # ffuf matches
+└── phase5_secrets.json   # Credential findings (CRITICAL + INFO)
+```
+
+## Project Structure
 
 ```
 .
-├── reconmaster/               # 核心框架
-│   ├── core/                  # 核心模块
-│   │   ├── subdomain_manager.py   # Phase 1: 子域名调度
-│   │   ├── url_collector.py       # Phase 2: URL 收集
-│   │   ├── url_processor.py       # Phase 3: 去重 + FUZZ 注入
-│   │   ├── fuzz_engine.py         # Phase 4: ffuf 调度
-│   │   └── js_analyzer.py         # Phase 5: JS 下载 + trufflehog
-│   ├── config/settings.py     # 全局配置
-│   ├── utils/                 # 工具函数
-│   └── wordlists/             # 字典文件
-├── oneforall/                 # OneForAll 子域名收集模块
-├── tools/                     # 外部工具二进制 + 辅助脚本
-│   ├── subfinder.exe
-│   ├── dnsx.exe
-│   ├── gau.exe
-│   ├── katana.exe
-│   ├── ffuf.exe
-│   ├── trufflehog.exe         # ← 需手动下载
-│   ├── fast_scan_js.py        # 快速 JS 扫描脚本
-│   └── ultra_fast_scan.py     # 极速 JS 扫描脚本
-├── tests/                     # 测试用例
-│   ├── test_phase1_subdomain.py   # 阶段 1 单独测试
-│   └── test_full_pipeline.py      # 全流程集成测试
-├── requirements.txt
-└── README.md
+├── run.py                      # CLI entry point
+├── reconmaster/                # Core framework
+│   ├── core/
+│   │   ├── subdomain_manager.py    # Phase 1: subdomain orchestration
+│   │   ├── url_collector.py        # Phase 2: gau + katana scheduler
+│   │   ├── url_processor.py        # Phase 3: dedup + FUZZ injection
+│   │   ├── fuzz_engine.py          # Phase 4: ffuf async scheduler
+│   │   └── js_analyzer.py          # Phase 5: secret detection
+│   ├── config/settings.py          # All configurable parameters
+│   ├── utils/domain_utils.py       # Domain validation helpers
+│   └── wordlists/                  # Built-in wordlists
+├── oneforall/                 # OneForAll subdomain module
+├── tools/                     # External binaries
+└── requirements.txt
 ```
-
-## 配置
-
-编辑 `reconmaster/config/settings.py`：
-
-- `HTTP_PROXY` — 代理地址（国内访问外网时使用）
-- `FOFA_KEY` — FOFA API Key
-- `TOOL_PATHS` — 各工具路径（默认从 `tools/` 读取）
-- 各阶段超时和并发参数
-
-## 运行测试
-
-```bash
-# 测试阶段 1（仅子域名收集）
-python tests/test_phase1_subdomain.py example.com
-
-# 测试全流程（5 阶段）
-python tests/test_full_pipeline.py example.com
-```
-
-## 输出
-
-扫描结果保存在 `results/<target>_<timestamp>/`，包含：
-- `summary.json` — 全流程汇总
-- `phase2_all_urls.txt` — 收集的 URL
-- `phase3_fuzz_tasks.txt` — FUZZ 任务
-- `phase5_js_analysis.json` — 密钥分析结果 (CRITICAL + INFO)

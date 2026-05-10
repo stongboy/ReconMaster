@@ -1,13 +1,14 @@
-"""
-JSAnalyzer — JS 深度分析（基于 Trufflehog）。
+"""JSAnalyzer — JavaScript secret detection via trufflehog.
 
-工作流：
-1. aiohttp 并发下载 js_url_pool 中 JS 到本地 tmp_js_workspace/
-2. asyncio 子进程调用 trufflehog filesystem --json --verify
-3. 解析 JSONL，按 Verified 分级：
-   - Verified == true  → CRITICAL（高置信度，优先交付）
-   - Verified == false → INFO（信息性发现，存档备查）
-4. shutil.rmtree 自动清理本地临时目录
+Modes (configure in settings.py → JS_ANALYSIS_MODE):
+  fast (default): Fetch homepage → extract <script src> → download → trufflehog
+                  ~3-8s per target. Recommended for initial reconnaissance.
+  deep:           Download all JS URLs from full URL collection → trufflehog.
+                  Slower but comprehensive. Requires prior URL collection phase.
+
+Output grading:
+  Verified == true  → CRITICAL (high-confidence credential leak)
+  Verified == false → INFO     (informational, archived for review)
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -27,6 +29,7 @@ import aiohttp
 
 from reconmaster.config.settings import (
     HTTP_PROXY,
+    JS_ANALYSIS_MODE,
     JS_ANALYSIS_TIMEOUT,
     JS_DOWNLOAD_CONCURRENCY,
     JS_DOWNLOAD_TIMEOUT,
@@ -36,134 +39,217 @@ from reconmaster.config.settings import (
 
 logger = logging.getLogger("reconmaster.js_analyzer")
 
+_SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+
+# Common JS entry points probed in fast mode
+_PROBE_PATHS = [
+    "/app.js", "/main.js", "/bundle.js", "/index.js",
+    "/static/js/app.js", "/static/js/main.js",
+    "/js/app.js", "/js/main.js", "/assets/index.js",
+    "/build/bundle.js",
+]
+
 
 class JSAnalyzer:
-    """JS 分析器：下载 → Trufflehog → 分级 → 清理。"""
+    """JavaScript secret scanner: download → trufflehog → classify → cleanup."""
 
-    def __init__(self, target_domain: str) -> None:
+    def __init__(self, target_domain: str, mode: str | None = None) -> None:
         self.target = target_domain.lower().rstrip(".")
+        self.mode = mode or JS_ANALYSIS_MODE
         self._workspace: Path | None = None
         self._session: aiohttp.ClientSession | None = None
         self.critical_vulns: list[dict[str, Any]] = []
         self.info_findings: list[dict[str, Any]] = []
+        self.stats: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
-    #  公共入口
+    #  Public API
     # ------------------------------------------------------------------
 
-    async def run(self, js_url_pool: list[str]) -> dict[str, Any]:
-        """主入口：下载 → 扫描 → 分级 → 清理。"""
+    async def run(self, js_url_pool: list[str] | None = None) -> dict[str, Any]:
+        """Execute JS analysis.
+
+        fast mode: js_url_pool is ignored; scans homepage + probe paths directly.
+        deep mode: downloads and scans every URL in js_url_pool.
+        """
+        if self.mode == "deep" and js_url_pool:
+            return await self._run_deep(js_url_pool)
+        return await self._run_fast()
+
+    # ------------------------------------------------------------------
+    #  Fast mode
+    # ------------------------------------------------------------------
+
+    async def _run_fast(self) -> dict[str, Any]:
+        """Fetch homepage HTML → extract <script src> → download → trufflehog."""
+        self._workspace = Path(tempfile.mkdtemp(prefix=JS_WORKSPACE_PREFIX))
+        logger.info("Fast scan: %s (workspace: %s)", self.target, self._workspace)
+
+        try:
+            html, base_url = await self._fetch_homepage()
+            if not html:
+                logger.warning("Homepage unreachable for %s", self.target)
+                return self._build_result()
+
+            js_urls = self._extract_script_urls(html, base_url)
+
+            # Append probe paths for commonly named bundles
+            for path in _PROBE_PATHS:
+                js_urls.add(f"{base_url.rstrip('/')}{path}")
+
+            # Save homepage HTML itself (secrets may be inline)
+            html_file = self._workspace / f"{self.target}.html"
+            html_file.write_text(html, encoding="utf-8")
+
+            downloaded = await self._download_js_files(js_urls)
+            logger.info("Fast scan: %d JS downloaded, %d URLs attempted",
+                        len(downloaded), len(js_urls))
+
+            if not downloaded and not html:
+                return self._build_result()
+
+            findings = await self._run_trufflehog()
+            self._classify(findings)
+            self.stats = {"mode": "fast", "js_downloaded": len(downloaded),
+                          "js_attempted": len(js_urls)}
+        except Exception:
+            logger.exception("Fast scan failed for %s", self.target)
+        finally:
+            self._cleanup()
+
+        return self._build_result()
+
+    async def _fetch_homepage(self) -> tuple[str | None, str]:
+        """Try HTTPS then HTTP, returning (html, base_url)."""
+        os.environ.setdefault("HTTP_PROXY", HTTP_PROXY)
+        os.environ.setdefault("HTTPS_PROXY", HTTP_PROXY)
+
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(
+            timeout=timeout, trust_env=True,
+            connector=aiohttp.TCPConnector(ssl=False, limit=4),
+        ) as session:
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{self.target}"
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            return await resp.text(), url
+                except Exception:
+                    continue
+        return None, f"https://{self.target}"
+
+    @staticmethod
+    def _extract_script_urls(html: str, base_url: str) -> set[str]:
+        """Extract absolute JS URLs from <script src> tags."""
+        urls: set[str] = set()
+        for m in _SCRIPT_SRC_RE.finditer(html):
+            src = m.group(1)
+            if not src:
+                continue
+            if src.startswith("http"):
+                urls.add(src)
+            elif src.startswith("//"):
+                urls.add(f"https:{src}")
+            elif src.startswith("/"):
+                p = base_url.split("/")
+                urls.add(f"{p[0]}//{p[2]}{src}")
+            else:
+                urls.add(f"{base_url.rstrip('/')}/{src}")
+        return urls
+
+    async def _download_js_files(self, urls: set[str]) -> dict[str, Path]:
+        """Concurrently download JS files, return {url: local_path}."""
+        result: dict[str, Path] = {}
+        semaphore = asyncio.Semaphore(JS_DOWNLOAD_CONCURRENCY)
+
+        async def dl_one(url: str) -> None:
+            async with semaphore:
+                path = await self._download_single(url)
+                if path:
+                    result[url] = path
+
+        timeout = aiohttp.ClientTimeout(total=JS_DOWNLOAD_TIMEOUT)
+        async with aiohttp.ClientSession(
+            timeout=timeout, trust_env=True,
+            connector=aiohttp.TCPConnector(ssl=False, limit=JS_DOWNLOAD_CONCURRENCY),
+        ) as session:
+            self._session = session
+            tasks = [dl_one(u) for u in urls]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        return result
+
+    # ------------------------------------------------------------------
+    #  Deep mode — full URL pool
+    # ------------------------------------------------------------------
+
+    async def _run_deep(self, js_url_pool: list[str]) -> dict[str, Any]:
+        """Download all JS from the URL collection pool, then scan."""
         if not js_url_pool:
-            logger.info("JS URL pool 为空，跳过分析")
+            logger.info("JS URL pool empty, skipping deep scan")
             return self._build_result()
 
         self._workspace = Path(tempfile.mkdtemp(prefix=JS_WORKSPACE_PREFIX))
-        logger.info("JS 工作区: %s | 待下载: %d", self._workspace, len(js_url_pool))
+        logger.info("Deep scan: %s | %d URLs queued", self._workspace, len(js_url_pool))
 
         try:
-            # Step 1 — 并发下载
-            downloaded = await self._download_all(js_url_pool)
-            logger.info("下载完成: %d/%d", len(downloaded), len(js_url_pool))
-
+            downloaded = await self._download_js_files(set(js_url_pool))
+            logger.info("Deep scan: %d/%d downloaded", len(downloaded), len(js_url_pool))
             if not downloaded:
-                logger.warning("无 JS 文件可扫描")
                 return self._build_result()
 
-            # Step 2 — Trufflehog 子进程扫描
-            findings = await self._run_trufflehog_analysis(downloaded)
-
-            # Step 3 — 分级
+            findings = await self._run_trufflehog()
             self._classify(findings)
-
+            self.stats = {"mode": "deep", "js_downloaded": len(downloaded),
+                          "js_attempted": len(js_url_pool)}
         except Exception:
-            logger.exception("JS 分析流程异常")
+            logger.exception("Deep scan failed for %s", self.target)
         finally:
             self._cleanup()
 
         return self._build_result()
 
     # ------------------------------------------------------------------
-    #  Step 1 — 并发下载 JS 到本地
+    #  Shared: download single file
     # ------------------------------------------------------------------
 
-    async def _download_all(self, urls: list[str]) -> dict[str, Path]:
-        """并发下载，返回 {source_url: local_path}。"""
-        semaphore = asyncio.Semaphore(JS_DOWNLOAD_CONCURRENCY)
-        result: dict[str, Path] = {}
-
-        async def download_one(url: str) -> None:
-            async with semaphore:
-                local = await self._download_single(url)
-                if local:
-                    result[url] = local
-
-        timeout = aiohttp.ClientTimeout(total=JS_DOWNLOAD_TIMEOUT)
-        # 注入代理环境变量，aiohttp trust_env 读取
-        os.environ.setdefault("HTTP_PROXY", HTTP_PROXY)
-        os.environ.setdefault("HTTPS_PROXY", HTTP_PROXY)
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            trust_env=True,
-            connector=aiohttp.TCPConnector(ssl=False, limit=JS_DOWNLOAD_CONCURRENCY),
-        ) as session:
-            self._session = session
-            tasks = [download_one(u) for u in urls]
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        return result
-
     async def _download_single(self, url: str) -> Path | None:
-        """下载单个 JS 文件，失败返回 None。"""
         assert self._workspace is not None
         assert self._session is not None
         try:
             async with self._session.get(url, timeout=JS_DOWNLOAD_TIMEOUT) as resp:
                 if resp.status != 200:
-                    logger.debug("HTTP %d: %s", resp.status, url)
                     return None
                 content = await resp.read()
-        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-            logger.debug("下载失败 %s: %s", url, exc)
+        except (asyncio.TimeoutError, aiohttp.ClientError):
             return None
 
         if not content or len(content) < 20:
             return None
 
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-        # 保留原始文件名后缀，便于 trufflehog 按类型识别
-        fname = f"{url_hash}.js"
-        local_path = self._workspace / fname
-
+        local = self._workspace / f"{url_hash}.js"
         header = (
             f"// source: {url}\n"
             f"// downloaded: {datetime.now(timezone.utc).isoformat()}\n\n"
         )
-        local_path.write_bytes(header.encode() + content)
-        logger.debug("已下载: %s → %s (%d bytes)", url, fname, len(content))
-        return local_path
+        local.write_bytes(header.encode() + content)
+        return local
 
     # ------------------------------------------------------------------
-    #  Step 2 — Trufflehog 子进程分析
+    #  Shared: trufflehog subprocess
     # ------------------------------------------------------------------
 
-    async def _run_trufflehog_analysis(
-        self, downloaded: dict[str, Path],
-    ) -> list[dict[str, Any]]:
-        """通过 trufflehog filesystem 扫描本地 JS 目录。
-
-        cmd: trufflehog filesystem <workspace> --json --verify
-        返回: 结构化 findings 列表
-        """
+    async def _run_trufflehog(self) -> list[dict[str, Any]]:
         assert self._workspace is not None
         cmd = [
             str(TOOL_PATHS["trufflehog"]),
-            "filesystem",
-            str(self._workspace),
-            "--json",             # JSONL 输出
-            "--no-update",
+            "filesystem", str(self._workspace),
+            "--json", "--no-update",
             "--results", "verified,unverified,unknown",
         ]
-        logger.info("→ trufflehog: %s", " ".join(cmd))
+        logger.info("→ trufflehog on %s", self._workspace.name)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -176,51 +262,31 @@ class JSAnalyzer:
                     proc.communicate(), timeout=JS_ANALYSIS_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                logger.error("trufflehog 超时 (%ds)，正在 kill", JS_ANALYSIS_TIMEOUT)
+                logger.error("trufflehog timed out after %ds", JS_ANALYSIS_TIMEOUT)
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
                 await proc.wait()
                 return []
-
         except FileNotFoundError:
-            logger.error("trufflehog 未找到，检查 TOOL_PATHS")
+            logger.error("trufflehog not found — download from https://github.com/trufflesecurity/trufflehog/releases")
             return []
         except Exception:
-            logger.exception("trufflehog 子进程异常")
+            logger.exception("trufflehog subprocess error")
             return []
 
-        # stderr 中的 warning 不致命
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-        if stderr_text:
-            logger.debug("trufflehog stderr: %s", stderr_text[:500])
-
-        return self._parse_trufflehog_output(stdout_bytes, stderr_text)
-
-    # ------------------------------------------------------------------
-    #  JSONL 解析
-    # ------------------------------------------------------------------
+        return self._parse_trufflehog_output(stdout_bytes)
 
     @staticmethod
-    def _parse_trufflehog_output(
-        stdout_bytes: bytes, stderr_text: str,
-    ) -> list[dict[str, Any]]:
-        """解析 trufflehog v3 JSONL 输出，提取关键字段。
+    def _parse_trufflehog_output(stdout_bytes: bytes) -> list[dict[str, Any]]:
+        """Parse trufflehog v3 JSONL output.
 
-        trufflehog 3.x 每行 JSON 格式：
-        - Raw / RawV2:    原始匹配内容
-        - Verified:       是否通过在线验证（bool）
-        - DetectorName:   检测器名称（GitHub, AWS, SlackWebhook …）
-        - DetectorType:   检测器类型编号（int）
-        - SourceMetadata.Data.Filesystem.file: 源文件路径
-        - SourceMetadata.Data.Filesystem.line: 行号
-        注意：部分行是日志（含 level 字段），非发现结果，需过滤。
+        Key fields: RawV2, Verified, DetectorName, SourceMetadata.Data.Filesystem
+        Log lines (contain "level" but no "DetectorType") are filtered out.
         """
         findings: list[dict[str, Any]] = []
-        raw_text = stdout_bytes.decode("utf-8", errors="replace")
-
-        for line_no, line in enumerate(raw_text.splitlines(), 1):
+        for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -229,94 +295,63 @@ class JSAnalyzer:
             except json.JSONDecodeError:
                 continue
 
-            # 过滤日志行（trufflehog 内部日志也走 stdout）
             if "level" in obj and "DetectorType" not in obj:
                 continue
 
-            raw = obj.get("RawV2", "") or obj.get("Raw", "")
-            verified = obj.get("Verified", False)
-            detector = obj.get("DetectorName", obj.get("DetectorType", "Unknown"))
-
-            # 提取文件路径 + 行号 (trufflehog 3.x 嵌套结构)
             meta = obj.get("SourceMetadata", {})
             fs_data = meta.get("Data", {}).get("Filesystem", {})
-            file_path = fs_data.get("file", obj.get("SourceName", ""))
-            line_num = fs_data.get("line", 0)
 
             findings.append({
-                "raw": raw,
-                "verified": verified,
-                "detector_type": str(detector),
-                "source_file": file_path,
-                "line": line_num,
+                "raw": obj.get("RawV2", "") or obj.get("Raw", ""),
+                "verified": obj.get("Verified", False),
+                "detector_type": str(obj.get("DetectorName", obj.get("DetectorType", "Unknown"))),
+                "source_file": fs_data.get("file", obj.get("SourceName", "")),
+                "line": fs_data.get("line", 0),
             })
 
-        logger.info(
-            "trufflehog 发现 %d 条 (verified=%d)",
-            len(findings),
-            sum(1 for f in findings if f["verified"]),
-        )
-
-        # 同时处理 stderr 中可能存在的引擎错误（如网络验证超时）
-        if "error" in stderr_text.lower():
-            logger.debug("trufflehog stderr 含 error: %s", stderr_text[:300])
-
+        logger.info("trufflehog: %d findings (verified=%d)",
+                    len(findings), sum(1 for f in findings if f["verified"]))
         return findings
 
     # ------------------------------------------------------------------
-    #  Step 3 — 分级处理
+    #  Shared: classification
     # ------------------------------------------------------------------
 
     def _classify(self, findings: list[dict[str, Any]]) -> None:
-        """按 Verified 字段分级。
-
-        Verified == True  → CRITICAL（高置信度密钥泄露，优先交付）
-        Verified == False → INFO    （信息性发现，存档备查）
-        """
+        """Grade by Verified field: True → CRITICAL, False → INFO."""
         for f in findings:
             if f["verified"]:
                 f["severity"] = "CRITICAL"
                 self.critical_vulns.append(f)
-                logger.warning(
-                    "[CRITICAL] %s | %s… | %s",
-                    f["detector_type"],
-                    str(f["raw"])[:60],
-                    Path(f.get("source_file", "")).name,
-                )
+                logger.warning("[CRITICAL] %s | %s… | %s",
+                               f["detector_type"], str(f["raw"])[:60],
+                               Path(f.get("source_file", "")).name)
             else:
                 f["severity"] = "INFO"
                 self.info_findings.append(f)
-                logger.info(
-                    "[INFO] %s | %s… | %s",
-                    f["detector_type"],
-                    str(f["raw"])[:40],
-                    Path(f.get("source_file", "")).name,
-                )
+                logger.info("[INFO] %s | %s… | %s",
+                            f["detector_type"], str(f["raw"])[:40],
+                            Path(f.get("source_file", "")).name)
 
-        logger.info(
-            "分级完成: CRITICAL=%d  INFO=%d",
-            len(self.critical_vulns), len(self.info_findings),
-        )
+        logger.info("Classification: CRITICAL=%d  INFO=%d",
+                    len(self.critical_vulns), len(self.info_findings))
 
     # ------------------------------------------------------------------
-    #  清理
+    #  Shared: cleanup
     # ------------------------------------------------------------------
 
     def _cleanup(self) -> None:
         if self._workspace and self._workspace.exists():
             try:
                 shutil.rmtree(self._workspace, ignore_errors=True)
-                logger.debug("JS 工作区已清理: %s", self._workspace)
             except Exception:
-                logger.warning("清理 JS 工作区失败: %s", self._workspace)
-
-    # ------------------------------------------------------------------
-    #  结果构建
-    # ------------------------------------------------------------------
+                logger.warning("Workspace cleanup failed: %s", self._workspace)
 
     def _build_result(self) -> dict[str, Any]:
         return {
             "target": self.target,
+            "mode": self.mode,
+            "stats": self.stats,
             "critical_count": len(self.critical_vulns),
             "info_count": len(self.info_findings),
             "critical_vulns": self.critical_vulns,

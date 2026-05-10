@@ -73,6 +73,8 @@ FUZZ_CALIBRATION_REQ = 5      # 自动校准请求数
 FUZZ_WORDLIST        = PROJECT_ROOT / "wordlists" / "fuzz_payloads.txt"
 
 # ---- JS Analysis ----
+JS_ANALYSIS_MODE        = "fast"   # "fast" (homepage script extraction, ~3-8s)
+                                    # "deep" (full URL pool download, comprehensive)
 JS_DOWNLOAD_CONCURRENCY = 8
 JS_DOWNLOAD_TIMEOUT     = 30.0
 JS_ANALYSIS_TIMEOUT     = 5 * 60
