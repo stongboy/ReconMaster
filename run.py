@@ -33,6 +33,19 @@ from reconmaster.core.js_analyzer import JSAnalyzer
 
 logger = logging.getLogger("reconmaster")
 
+DEFAULT_SCAN_MODULES = {
+    "subfinder",
+    "github",
+    "fofa",
+    "oneforall",
+    "dnsx_verify",
+    "dnsx_brute",
+    "gau",
+    "katana",
+    "ffuf",
+    "js",
+}
+
 
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -43,8 +56,13 @@ def setup_logging(verbose: bool = False) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-async def run_pipeline(target: str, deep_js: bool = False) -> dict:
+async def run_pipeline(
+    target: str,
+    deep_js: bool = False,
+    modules: set[str] | None = None,
+) -> dict:
     """Execute the full 5-phase reconnaissance pipeline."""
+    enabled_modules = modules or DEFAULT_SCAN_MODULES
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path("results") / f"{target}_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -58,27 +76,33 @@ async def run_pipeline(target: str, deep_js: bool = False) -> dict:
     #  Phase 1 — Subdomain enumeration + verification
     # ==================================================================
     print("\n[Phase 1/5] Subdomain enumeration …")
-    mgr = SubdomainManager(target)
+    mgr = SubdomainManager(target, enabled_sources=enabled_modules)
     sub_result = await mgr.run()
-    verified = sub_result["verified_passive"]
-    print(f"  Verified: {len(verified)} subdomains")
-    print(f"  Active (brute-force): {len(sub_result.get('verified_active', []))}")
+    verified = sub_result.get("subdomains") or sub_result.get("verified_passive", [])
+    print(f"  Subdomains: {len(verified)}")
+    print(f"  Active (brute-force): {len(sub_result.get('active', []))}")
+    _save_json(out_dir / "phase1_subdomains.json", sub_result)
 
     # ==================================================================
     #  Phase 2 — URL collection
     # ==================================================================
-    print("\n[Phase 2/5] URL collection (gau + katana) …")
-    collector = URLCollector(target)
-    subdomains_http = [s for s in verified if not s.startswith("http")]
-    url_result = await collector.collect(subdomains_http[:20])
-    all_urls = url_result["all"]
-    print(f"  gau (Wayback):    {len(url_result['gau'])}")
-    print(f"  katana (crawl):   {len(url_result['katana'])}")
-    print(f"  Unique total:     {len(all_urls)}")
+    all_urls: list[str] = []
+    if {"gau", "katana"} & enabled_modules:
+        print("\n[Phase 2/5] URL collection (gau + katana) …")
+        collector = URLCollector(target)
+        subdomains_http = [s for s in verified if not s.startswith("http")]
+        url_result = await collector.collect(subdomains_http[:20], enabled_sources=enabled_modules)
+        all_urls = url_result["all"]
+        print(f"  gau (Wayback):    {len(url_result['gau'])}")
+        print(f"  katana (crawl):   {len(url_result['katana'])}")
+        print(f"  Unique total:     {len(all_urls)}")
 
-    _save_json(out_dir / "phase2_urls.json", {
-        "gau": url_result["gau"], "katana": url_result["katana"], "all": all_urls,
-    })
+        _save_json(out_dir / "phase2_urls.json", {
+            "gau": url_result["gau"], "katana": url_result["katana"], "all": all_urls,
+        })
+    else:
+        print("\n[Phase 2/5] URL collection — skipped")
+        _save_json(out_dir / "phase2_urls.json", {"gau": [], "katana": [], "all": []})
 
     if not all_urls:
         print("  No URLs collected — skipping further phases")
@@ -106,7 +130,7 @@ async def run_pipeline(target: str, deep_js: bool = False) -> dict:
     #  Phase 4 — Web fuzzing
     # ==================================================================
     fuzz_matches: list[dict] = []
-    if fuzz_tasks:
+    if fuzz_tasks and "ffuf" in enabled_modules:
         print("\n[Phase 4/5] Web fuzzing (ffuf) …")
         engine = FuzzEngine()
         fuzz_matches = await engine.run(fuzz_tasks[:15])
@@ -120,32 +144,43 @@ async def run_pipeline(target: str, deep_js: bool = False) -> dict:
     # ==================================================================
     #  Phase 5 — Secret detection (JS analysis)
     # ==================================================================
-    print(f"\n[Phase 5/5] Secret detection (JS analysis) …")
-    mode = "deep" if deep_js else "fast"
-    analyzer = JSAnalyzer(target, mode=mode)
+    if "js" in enabled_modules:
+        print(f"\n[Phase 5/5] Secret detection (JS analysis) …")
+        mode = "deep" if deep_js else "fast"
+        analyzer = JSAnalyzer(target, mode=mode)
 
-    if mode == "deep" and js_pool:
-        js_result = await analyzer.run(js_pool[:50])
+        if mode == "deep" and js_pool:
+            js_result = await analyzer.run(js_pool[:50])
+        else:
+            js_result = await analyzer.run()
+
+        print(f"  Mode:      {js_result.get('mode', mode)}")
+        print(f"  CRITICAL:  {js_result['critical_count']}")
+        print(f"  INFO:      {js_result['info_count']}")
+
+        if js_result["critical_count"] > 0:
+            print("\n  !!! CRITICAL FINDINGS !!!")
+            for v in js_result["critical_vulns"]:
+                print(f"  [{v['detector_type']:25s}] {str(v['raw'])[:80]}")
+        elif js_result["info_count"] > 0:
+            for v in js_result["info_findings"][:3]:
+                print(f"  [{v['detector_type']:25s}] {str(v['raw'])[:60]}")
+
+        _save_json(out_dir / "phase5_secrets.json", {
+            "critical": js_result["critical_vulns"],
+            "info": js_result["info_findings"],
+            "stats": js_result.get("stats", {}),
+        })
     else:
-        js_result = await analyzer.run()
-
-    print(f"  Mode:      {js_result.get('mode', mode)}")
-    print(f"  CRITICAL:  {js_result['critical_count']}")
-    print(f"  INFO:      {js_result['info_count']}")
-
-    if js_result["critical_count"] > 0:
-        print("\n  !!! CRITICAL FINDINGS !!!")
-        for v in js_result["critical_vulns"]:
-            print(f"  [{v['detector_type']:25s}] {str(v['raw'])[:80]}")
-    elif js_result["info_count"] > 0:
-        for v in js_result["info_findings"][:3]:
-            print(f"  [{v['detector_type']:25s}] {str(v['raw'])[:60]}")
-
-    _save_json(out_dir / "phase5_secrets.json", {
-        "critical": js_result["critical_vulns"],
-        "info": js_result["info_findings"],
-        "stats": js_result.get("stats", {}),
-    })
+        print(f"\n[Phase 5/5] Secret detection — skipped")
+        js_result = {
+            "critical_count": 0,
+            "info_count": 0,
+            "critical_vulns": [],
+            "info_findings": [],
+            "stats": {},
+        }
+        _save_json(out_dir / "phase5_secrets.json", {"critical": [], "info": [], "stats": {}})
 
     # ==================================================================
     #  Summary
@@ -160,6 +195,7 @@ async def run_pipeline(target: str, deep_js: bool = False) -> dict:
         "phase4_fuzz_matches": len(fuzz_matches),
         "phase5_critical": js_result["critical_count"],
         "phase5_info": js_result["info_count"],
+        "modules": sorted(enabled_modules),
     }
     _save_json(out_dir / "summary.json", summary)
 
@@ -187,11 +223,14 @@ def main() -> None:
     parser.add_argument("target", help="Target domain (e.g. example.com)")
     parser.add_argument("--deep", action="store_true",
                         help="Deep JS scan: use full URL pool instead of fast homepage extraction")
+    parser.add_argument("--modules", default="",
+                        help="Comma-separated modules to run, e.g. subfinder,dnsx_verify,gau")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
     setup_logging(verbose=args.verbose)
-    asyncio.run(run_pipeline(args.target, deep_js=args.deep))
+    modules = {m.strip() for m in args.modules.split(",") if m.strip()} or None
+    asyncio.run(run_pipeline(args.target, deep_js=args.deep, modules=modules))
 
 
 if __name__ == "__main__":

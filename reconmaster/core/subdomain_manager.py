@@ -72,16 +72,19 @@ class SubdomainManager:
         tool_paths: dict[str, str | Path] | None = None,
         dnsx_resolvers: Path | None = None,
         output_dir: Path | None = None,
+        enabled_sources: set[str] | None = None,
     ) -> None:
         self.target = target.lower().rstrip(".")
         self.wordlist = Path(wordlist) if wordlist else DEFAULT_WORDLIST
         self.tool_paths = {**TOOL_PATHS, **(tool_paths or {})}
         self.dnsx_resolvers = Path(dnsx_resolvers) if dnsx_resolvers else DNSX_RESOLVERS_FILE
         self.output_dir = Path(output_dir) if output_dir else PROJECT_ROOT.parent / "results"
+        self.enabled_sources = enabled_sources
 
         # 运行时状态
         self._passive_raw: list[str] = []
         self._active_raw: list[str] = []
+        self._source_map: dict[str, set[str]] = {}
         self._fofa_context: list[dict[str, Any]] = []  # FOFA ip:port/protocol 缓存
         self._tmp_dir: Path | None = None
         self._tmp_files: list[Path] = []
@@ -102,12 +105,21 @@ class SubdomainManager:
             await self._collect_passive()
 
             # -- 阶段 2: 被动结果验活清洗 -----------------------------------
-            logger.info("[阶段 2/4] dnsx 验活清洗被动收集结果")
-            verified_passive = await self._verify_passive()
+            if self._enabled("dnsx_verify"):
+                logger.info("[阶段 2/4] dnsx 验活清洗被动收集结果")
+                verified_passive = await self._verify_passive()
+            else:
+                logger.info("[阶段 2/4] 跳过 dnsx 验活，使用清洗后的被动结果")
+                verified_passive = filter_and_dedup(self._passive_raw)
 
             # -- 阶段 3: 主动爆破 -----------------------------------
-            logger.info("[阶段 3/4] dnsx 主动子域名爆破")
-            self._active_raw = await self._enumerate_active()
+            if self._enabled("dnsx_brute"):
+                logger.info("[阶段 3/4] dnsx 主动子域名爆破")
+                self._active_raw = await self._enumerate_active()
+                self._remember_source("dnsx_brute", self._active_raw)
+            else:
+                logger.info("[阶段 3/4] 跳过 dnsx 主动爆破")
+                self._active_raw = []
 
             # -- 阶段 4: 合并去重 -----------------------------------
             logger.info("[阶段 4/4] 合并去重最终输出")
@@ -135,6 +147,12 @@ class SubdomainManager:
         result_file = self.output_dir / f"{self.target}_{timestamp}.txt"
         result_file.write_text("\n".join(final), encoding="utf-8")
         logger.info("结果已保存: %s", result_file)
+        final_set = set(final)
+        source_output = {
+            source: sorted(hosts & final_set)
+            for source, hosts in self._source_map.items()
+            if hosts & final_set
+        }
 
         return {
             "target": self.target,
@@ -147,6 +165,7 @@ class SubdomainManager:
             "verified_passive": verified_passive,
             "active": self._active_raw,
             "fofa_context": self._fofa_context,
+            "sources": source_output,
         }
 
     # ------------------------------------------------------------------
@@ -155,41 +174,45 @@ class SubdomainManager:
 
     async def _collect_passive(self) -> None:
         """依次运行 subfinder → github-subdomains → FOFA → OneForAll。"""
-        # subfinder
-        try:
-            sf = await self._run_subfinder()
-            self._passive_raw.extend(sf)
-            logger.info("subfinder 完成: %d 条", len(sf))
-        except Exception:
-            logger.exception("subfinder 失败，继续下一工具")
+        if self._enabled("subfinder"):
+            try:
+                sf = await self._run_subfinder()
+                self._passive_raw.extend(sf)
+                self._remember_source("subfinder", sf)
+                logger.info("subfinder 完成: %d 条", len(sf))
+            except Exception:
+                logger.exception("subfinder 失败，继续下一工具")
 
-        # github-subdomains
-        try:
-            gs = await self._run_github_subdomains()
-            self._passive_raw.extend(gs)
-            logger.info("github-subdomains 完成: %d 条", len(gs))
-        except Exception:
-            logger.exception("github-subdomains 失败，继续下一工具")
+        if self._enabled("github"):
+            try:
+                gs = await self._run_github_subdomains()
+                self._passive_raw.extend(gs)
+                self._remember_source("github", gs)
+                logger.info("github-subdomains 完成: %d 条", len(gs))
+            except Exception:
+                logger.exception("github-subdomains 失败，继续下一工具")
 
-        # FOFA API
-        try:
-            fofa_domains, fofa_context = await self._run_fofa_api()
-            self._passive_raw.extend(fofa_domains)
-            self._fofa_context = fofa_context
-            logger.info(
-                "FOFA 完成: %d 域名 + %d 端口上下文",
-                len(fofa_domains), len(fofa_context),
-            )
-        except Exception:
-            logger.exception("FOFA 失败，继续下一工具")
+        if self._enabled("fofa"):
+            try:
+                fofa_domains, fofa_context = await self._run_fofa_api()
+                self._passive_raw.extend(fofa_domains)
+                self._remember_source("fofa", fofa_domains)
+                self._fofa_context = fofa_context
+                logger.info(
+                    "FOFA 完成: %d 域名 + %d 端口上下文",
+                    len(fofa_domains), len(fofa_context),
+                )
+            except Exception:
+                logger.exception("FOFA 失败，继续下一工具")
 
-        # OneForAll
-        try:
-            oa = await self._run_oneforall()
-            self._passive_raw.extend(oa)
-            logger.info("OneForAll 完成: %d 条", len(oa))
-        except Exception:
-            logger.exception("OneForAll 失败，继续后续流程")
+        if self._enabled("oneforall"):
+            try:
+                oa = await self._run_oneforall()
+                self._passive_raw.extend(oa)
+                self._remember_source("oneforall", oa)
+                logger.info("OneForAll 完成: %d 条", len(oa))
+            except Exception:
+                logger.exception("OneForAll 失败，继续后续流程")
 
     # ------------------------------------------------------------------
     #  阶段 2 — 被动结果验活
@@ -541,3 +564,13 @@ class SubdomainManager:
                 logger.debug("临时目录已清理: %s", self._tmp_dir)
             except Exception:
                 logger.warning("清理临时目录失败: %s", self._tmp_dir)
+
+    def _enabled(self, name: str) -> bool:
+        return self.enabled_sources is None or name in self.enabled_sources
+
+    def _remember_source(self, source: str, hosts: list[str]) -> None:
+        bucket = self._source_map.setdefault(source, set())
+        for host in hosts:
+            clean = normalize(host)
+            if clean:
+                bucket.add(clean)

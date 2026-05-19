@@ -41,7 +41,11 @@ class URLCollector:
     #  公共入口 — 针对子域名列表收集
     # ------------------------------------------------------------------
 
-    async def collect(self, subdomains: list[str]) -> dict[str, list[str]]:
+    async def collect(
+        self,
+        subdomains: list[str],
+        enabled_sources: set[str] | None = None,
+    ) -> dict[str, list[str]]:
         """对每个子域名并发执行 gau + katana，返回合并后的 URL 列表。
 
         Returns:
@@ -56,24 +60,26 @@ class URLCollector:
             len(subdomains),
         )
 
-        # gau — 所有子域名并发
-        gau_tasks = [self._run_gau(sub) for sub in subdomains]
-        gau_results = await asyncio.gather(*gau_tasks, return_exceptions=True)
-        for i, res in enumerate(gau_results):
-            if isinstance(res, Exception):
-                logger.warning("gau[%s] 异常: %s", subdomains[i], res)
-            elif res:
-                self._gau_urls.extend(res)
+        if enabled_sources is None or "gau" in enabled_sources:
+            # gau — 所有子域名并发
+            gau_tasks = [self._run_gau(sub) for sub in subdomains]
+            gau_results = await asyncio.gather(*gau_tasks, return_exceptions=True)
+            for i, res in enumerate(gau_results):
+                if isinstance(res, Exception):
+                    logger.warning("gau[%s] 异常: %s", subdomains[i], res)
+                elif res:
+                    self._gau_urls.extend(res)
 
-        # katana — 限制并发数的并发（katana 自身已做爬取限速）
-        sem = asyncio.Semaphore(5)
-        katana_tasks = [self._run_katana(sub, sem) for sub in subdomains]
-        katana_results = await asyncio.gather(*katana_tasks, return_exceptions=True)
-        for i, res in enumerate(katana_results):
-            if isinstance(res, Exception):
-                logger.warning("katana[%s] 异常: %s", subdomains[i], res)
-            elif res:
-                self._katana_urls.extend(res)
+        if enabled_sources is None or "katana" in enabled_sources:
+            # katana — 限制并发数的并发（katana 自身已做爬取限速）
+            sem = asyncio.Semaphore(5)
+            katana_tasks = [self._run_katana(sub, sem) for sub in subdomains]
+            katana_results = await asyncio.gather(*katana_tasks, return_exceptions=True)
+            for i, res in enumerate(katana_results):
+                if isinstance(res, Exception):
+                    logger.warning("katana[%s] 异常: %s", subdomains[i], res)
+                elif res:
+                    self._katana_urls.extend(res)
 
         all_urls = sorted(set(self._gau_urls + self._katana_urls))
         logger.info(
