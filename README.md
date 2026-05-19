@@ -18,6 +18,47 @@ python run.py example.com
 python run.py example.com --deep     # comprehensive JS analysis (slower)
 ```
 
+## 升级版说明
+
+这一版把 ReconMaster 从命令行扫描工具升级为本地浏览器控制台，面向红队前期信息打点流程，集中处理资产录入、资产归属、内容提取、FOFA 查询语句生成和扫描任务调度。
+
+### 升级了什么
+
+- 新增本地 Web 控制台，可以在浏览器中访问和操作。
+- 新增 SQLite 资产库，使用 `companies` 和 `assets` 保存公司与资产归属关系。
+- 新增单个录入、批量录入、Excel 导入预览、URL/域名/IP 提取、资产列表筛选、CSV 导出和导入统计。
+- 新增 FOFA 查询语句生成和历史记录，方便把根域名快速转换为可复制的查询条件。
+- 批量录入会自动清洗混合文本中的域名，并按已有根域名资产继承公司；无法匹配时归入 `默认公司`。
+- 资产去重以 `domain_key = 子域名或根域名` 为准，URL 只作为资产补充信息，不会因为 URL 不同而生成重复资产。
+- 保留 ReconMaster 原有扫描能力，并支持从界面选择扫描模块、后台运行、查看日志、取消任务和回填扫描结果。
+
+### 这一版能干什么
+
+- 录入公司、根域名、子域名、URL 等资产信息。
+- 从粘贴文本中自动提取域名、IP 和 URL，并把提取出的域名送入批量录入。
+- 导入 Excel 资产表，先预览清洗结果，再确认入库。
+- 通过资产列表按公司、根域名、状态、来源和关键词检索资产。
+- 对 Pending 资产进行后台 DNS 解析，解析成功后自动更新为 Resolved。
+- 生成 FOFA 查询语句并保留生成历史。
+- 导出资产 CSV，便于后续分析或交付。
+- 在同一个页面调度 ReconMaster 扫描任务，并把发现的子域名、URL 和 fuzz 结果回填资产库。
+
+## 本地 Web 控制台
+
+启动浏览器控制台：
+
+```bash
+python web_ui.py --host 127.0.0.1 --port 8765
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8765/
+```
+
+控制台会在后台启动现有 `run.py` 流程，实时展示日志，支持取消任务，并读取 `results/` 中生成的 JSON 结果文件。
+
 ## Pipeline
 
 Run `python run.py <target>` to execute all five phases:

@@ -27,6 +27,11 @@ tools/trufflehog.exe
 
 # Database
 *.db
+*.db-shm
+*.db-wal
+
+# Local verification artifacts
+artifacts/
 
 # Temp files
 *.tmp
